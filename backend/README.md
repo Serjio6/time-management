@@ -1,0 +1,148 @@
+# FlowState AI — Backend
+
+Node.js/Express + MongoDB + Redis backend for the FlowState AI time-management
+platform, generated from the technical specification.
+
+## Stack
+
+- Node.js 20, Express 4
+- MongoDB 7 (Mongoose 8)
+- Redis 7 (cache / Socket.io adapter target)
+- OpenAI (gpt-4o-mini by default) for the AI coach and roadmap generation
+- Firebase Admin for authentication, exchanged for a first-party JWT session
+- Socket.io for real-time focus/schedule/habit events
+- node-cron for the three background jobs described in the spec
+
+## Project structure
+
+```
+backend/
+├── src/
+│   ├── config/        # database, redis, openai, firebase
+│   ├── controllers/    # one per resource (auth, task, schedule, habit, goal, focus, chat, analytics, user)
+│   ├── services/       # ai, scheduler, notification, analytics, calendar-sync, socket
+│   ├── models/         # User, Task, Schedule, Habit, Goal, FocusSession, ChatConversation, AnalyticsDaily
+│   ├── routes/         # matches controllers 1:1
+│   ├── middleware/      # auth, rate limiting, validation, error handling
+│   ├── utils/           # encryption, date helpers, Joi validators, logger
+│   ├── jobs/             # dailySchedule, habitReminder, analyticsAggregation
+│   └── app.js
+├── tests/
+├── Dockerfile
+├── jest.config.js
+└── package.json
+```
+
+## Setup
+
+1. **Install dependencies**
+
+   ```bash
+   npm install
+   ```
+
+2. **Configure environment**
+
+   ```bash
+   cp .env.example .env
+   ```
+
+   Fill in at minimum:
+   - `MONGODB_URI` — a running MongoDB 7 instance
+   - `REDIS_URL` — a running Redis instance (the server logs a warning and
+     continues without it if unavailable, but Socket.io scaling and caching
+     need it in production)
+   - `FIREBASE_PROJECT_ID` / `FIREBASE_CLIENT_EMAIL` / `FIREBASE_PRIVATE_KEY`
+     (or a single `FIREBASE_SERVICE_ACCOUNT` JSON string) — from your Firebase
+     project's service account
+   - `OPENAI_API_KEY` — required for `/api/chat/message` and
+     `/api/goals/:id/ai-roadmap`
+   - `JWT_SECRET` and `ENCRYPTION_KEY` — long random strings; `ENCRYPTION_KEY`
+     encrypts stored Google Calendar OAuth tokens
+
+3. **Run MongoDB and Redis locally** (or point the URIs above at hosted
+   instances), then start the API:
+
+   ```bash
+   npm run dev     # nodemon, auto-restarts on change
+   # or
+   npm start        # plain node
+   ```
+
+   The server listens on `PORT` (default `3000`) and exposes `GET /health`
+   for container/orchestrator health checks.
+
+4. **Run tests**
+
+   ```bash
+   npm test
+   ```
+
+   The included suite covers the scheduling scoring logic in
+   `scheduler.service.js`. Extend `tests/unit` and `tests/integration` as you
+   build out more coverage — `mongodb-memory-server` is already a devDependency
+   for spinning up an ephemeral Mongo instance in integration tests.
+
+## Authentication flow
+
+The frontend authenticates the user with Firebase (client SDK), then sends
+the resulting Firebase ID token as a Bearer token to `POST /api/auth/login`
+(or `/register` for a new account). The backend verifies it against Firebase,
+upserts the `User` document, and returns a first-party JWT. Every other
+`/api/*` route expects `Authorization: Bearer <that JWT>` and is protected by
+`authMiddleware`, which also transparently re-verifies a raw Firebase token if
+one is presented directly (useful right after login before the JWT is
+cached client-side).
+
+## AI integration
+
+`services/ai.service.js` implements the OpenAI tool-calling flow described in
+the spec: `create_schedule`, `create_task`, and `suggest_break` function
+tools, with a system prompt built from the user's live productivity stats,
+tasks, habits, and goals. `POST /api/chat/message` is rate-limited to 10
+requests/minute per user (`aiLimiter`) on top of the general 100/15min API
+limit.
+
+## Real-time events
+
+`services/socket.service.js` authenticates each socket connection with the
+same JWT and joins a `user:<id>` room. Emitted events: `focus:started`,
+`focus:ended`, `task:updated`, `schedule:adjusted`, `habit:completed`, and
+`notification`. Wire a Redis adapter (`socket.io-redis` /
+`@socket.io/redis-adapter`) if you deploy more than one API replica — the spec
+lists 3 replicas in `docker-compose.yml`, so add the adapter before scaling
+horizontally in production.
+
+## Background jobs
+
+Started from `app.js` on boot:
+
+- **dailySchedule.job.js** — 05:00 daily, pre-generates a draft schedule for
+  users active in the last 30 days who don't already have one for today.
+- **habitReminder.job.js** — runs every minute, fires a push/in-app
+  notification for any habit whose `reminderTime` matches the current clock
+  minute.
+- **analyticsAggregation.job.js** — 00:10 daily, computes and stores the
+  previous day's `AnalyticsDaily` document for every active user.
+
+## Docker
+
+```bash
+docker build -t flowstate-backend .
+docker run -p 3000:3000 --env-file .env flowstate-backend
+```
+
+Or bring up the full stack (API + Mongo + Redis) with the root-level
+`docker-compose.yml` once the frontend is added.
+
+## Notes / things to configure before production
+
+- `notification.service.js` needs `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` for
+  Web Push; without them, push sends are silently skipped and only in-app
+  (Socket.io) notifications fire.
+- `calendar-sync.service.js` needs `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`
+  / `GOOGLE_REDIRECT_URI`; it throws a clear error rather than failing
+  silently if Google Calendar sync is invoked without them.
+- Text search on tasks (`GET /api/tasks?search=`) relies on the Mongo text
+  index defined in `models/Task.js`; make sure `autoIndex` runs at least once
+  (default in non-production) or create the indexes manually in production.
